@@ -19,6 +19,7 @@ import java.time.{LocalDate, LocalDateTime, OffsetDateTime, ZoneId, ZoneOffset, 
 import java.time.format.{DateTimeFormatter, DateTimeParseException}
 import java.time.temporal.TemporalQueries
 import java.util.UUID
+import java.util.Properties
 import scala.collection.concurrent.TrieMap
 import scala.concurrent.duration.*
 import scala.concurrent.{Future, Promise}
@@ -37,28 +38,13 @@ import scala.util.{Failure, Success}
  *  4. Disconnect.
  *
  * NOTE: This is *not* production-grade – e.g. it uses blocking waits and the
- *       IB timeout is hard-coded.  However it is sufficient for an MVP and is
+ *       IB timeout is hard-coded. However it is sufficient for an MVP and is
  *       deliberately kept “low-touch” as requested.
  */
 object Indices extends IOApp {
 
   // ---------------------------------------------------------------------------
-  // Configuration
-  // ---------------------------------------------------------------------------
-
-  /** Skunk session (single connection) */
-  private val dbSession: Resource[IO, Session[IO]] =
-    Session.single(
-      host     = "127.0.0.1",
-      user     = "postgres",
-      database = "postgres",
-      password = Some("70f5RVb0MDOc2OPps7s8t6dOky4kWR"),
-      port     = 5432,
-      debug    = false
-    )
-
-  // ---------------------------------------------------------------------------
-  // Program entrypoint
+  // Program entry-point
   // ---------------------------------------------------------------------------
 
   override def run(args: List[String]): IO[ExitCode] = {
@@ -66,6 +52,21 @@ object Indices extends IOApp {
     val ibWrapper   = new MyWrapper(histPromise)
 
     for {
+      // Load DB configuration (non-blocking)
+      cfg                 <- loadDbConfig
+      (host, port, user,
+       database, pwdOpt)  = cfg
+
+      // Construct Skunk session resource using the loaded config
+      dbSession = Session.single(
+        host     = host,
+        port     = port,
+        user     = user,
+        database = database,
+        password = pwdOpt,      // may be None if the env-var is not set
+        debug    = false
+      )
+
       // 1) Connect to IB
       _ <- connectToIb(ibWrapper)
 
@@ -76,7 +77,7 @@ object Indices extends IOApp {
       _ <- IO.sleep(60.seconds)
 
       // 4) Persist everything to Postgres
-      _ <- persistBars(ibWrapper)
+      _ <- persistBars(ibWrapper, dbSession)
 
       // 5) Disconnect
       _ <- IO(ibWrapper.eClientSocket.eDisconnect())
@@ -100,8 +101,29 @@ object Indices extends IOApp {
       _ <- IO.sleep(5.seconds)
     } yield ()
 
+  /**
+   * Reads `db.conf` from the classpath and combines it with the `DB_PASSWORD`
+   * environment variable (if present).  The password is therefore never stored
+   * in Git.
+   */
+  private def loadDbConfig: IO[(String, Int, String, String, Option[String])] = IO.blocking {
+    val props = new Properties()
+    Option(getClass.getClassLoader.getResourceAsStream("db.conf")).foreach(props.load)
+
+    val host     = props.getProperty("host", "127.0.0.1")
+    val port     = props.getProperty("port", "5432").toInt
+    val user     = props.getProperty("user", "postgres")
+    val database = props.getProperty("database", "postgres")
+    val pwdOpt   = Option(System.getenv("DB_PASSWORD"))
+
+    (host, port, user, database, pwdOpt)
+  }
+
   /** Flattens the in-memory bar cache of [[MyWrapper]] and writes it to Postgres */
-  private def persistBars(wrapper: MyWrapper): IO[Unit] = {
+  private def persistBars(
+      wrapper:    MyWrapper,
+      dbSessionR: Resource[IO, Session[IO]]
+  ): IO[Unit] = {
     val uniqueId = UUID.randomUUID()
     val now      = LocalDateTime.now()
 
@@ -131,7 +153,7 @@ object Indices extends IOApp {
       }.toList
 
     // Persist in batches to avoid huge INSERTs
-    val insertAll: IO[Unit] = dbSession.use { sess =>
+    val insertAll: IO[Unit] = dbSessionR.use { sess =>
       flattened
         .grouped(1024)
         .toList
