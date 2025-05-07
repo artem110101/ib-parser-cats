@@ -30,7 +30,9 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.jdk.CollectionConverters.*
 import scala.util.{Failure, Success}
 
-
+/* ------------------------------------------------------------------------------------------------------------------ */
+/*  SQL helpers                                                                                                       */
+/* ------------------------------------------------------------------------------------------------------------------ */
 
 def insertManyBars(ps: List[BarInsert]) = {
   val enc = (
@@ -49,88 +51,76 @@ def insertManyBars(ps: List[BarInsert]) = {
       timestamp *:
       varchar
     ).to[BarInsert].values.list(ps)
-  sql"""INSERT INTO ticks (con_id, date, ticker, metric, timeframe, open, high, low, close, volume, "barCount", unique_id, event_time, source) VALUES $enc""".command
+
+  sql"""
+        INSERT INTO ticks
+          (con_id, date, ticker, metric, timeframe, open, high, low, close,
+           volume, "barCount", unique_id, event_time, source)
+        VALUES $enc
+     """.command
 }
 
-def awaitAllPromises(historicalPromises: TrieMap[Int, Promise[Unit]]): IO[Unit] = {
-  val futures = historicalPromises.values.toList.map { promise =>
-    IO.fromFuture(IO(promise.future))
-  }
+/* ------------------------------------------------------------------------------------------------------------------ */
+/*  Runtime helpers                                                                                                   */
+/* ------------------------------------------------------------------------------------------------------------------ */
 
-  futures.sequence_.void
-}
+/** Wait for every Promise already present in the map to complete.
+  * A snapshot is taken first and each Future is awaited **in parallel**.
+  */
+def awaitAllPromises(historicalPromises: TrieMap[Int, Promise[Unit]]): IO[Unit] =
+  historicalPromises
+    .values
+    .toList                       // snapshot
+    .parTraverse_(p => IO.fromFuture(IO(p.future)))
 
-def indicesHistoric(wrapper: MyWrapper): IO[Unit] = IO {
-  val results = ArrayBuffer[Int]()
+/** Issue historical data requests for a fixed set of indices. */
+def indicesHistoric(wrapper: MyWrapper): IO[Unit] = {
+  /* ----------------------- contracts we are interested in ----------------------- */
+  val contracts: List[Contract] =
+    List(
+      "VIX"   -> "CBOE",
+      "V2TX"  -> "EUREX",
+      "ESTX50"-> "EUREX",
+      "SX7E"  -> "EUREX",
+      "XSP"   -> "CBOE",
+      "SPX"   -> "CBOE"
+    ).map { case (symbol, exchange) =>
+      val c = Contract()
+      c.symbol(symbol)
+      c.secType("IND")
+      c.exchange(exchange)
+      c
+    }
 
-  val contract1 = Contract()
-  contract1.symbol("VIX")
-  contract1.secType("IND")
-  contract1.exchange("CBOE")
+  /* ----------------------- request parameters ---------------------------------- */
+  val dataTypes  = List("TRADES", "OPTION_IMPLIED_VOLATILITY")
+  val timeframe  = "1 week"
+  val duration   = "5 Y"
 
-  val contract2 = Contract()
-  contract2.symbol("V2TX")
-  contract2.secType("IND")
-  contract2.exchange("EUREX")
+  /* ----------------------- fire the requests ----------------------------------- */
+  contracts.traverse_ { contract =>
+    dataTypes.traverse_ { dataType =>
+      IO.delay {
+        val reqId = wrapper.reqIdCounter.incrementAndGet()
 
-  val contract3 = Contract()
-  contract3.symbol("ESTX50")
-  contract3.secType("IND")
-  contract3.exchange("EUREX")
+        // bookkeeping so that responses can be correlated
+        wrapper.reqIdToContract.put(reqId, (contract, dataType, timeframe))
+        wrapper.historicalPromises.put(reqId, Promise[Unit]())
 
-  val contract4 = Contract()
-  contract4.symbol("SX7E")
-  contract4.secType("IND")
-  contract4.exchange("EUREX")
-
-  val contract5 = Contract()
-  contract5.symbol("XSP")
-  contract5.secType("IND")
-  contract5.exchange("CBOE")
-
-  val contract6 = Contract()
-  contract6.symbol("SPX")
-  contract6.secType("IND")
-  contract6.exchange("CBOE")
-
-  // CAC40
-  // V1X - germany
-
-  val contracts = List(contract1, contract2, contract3, contract4, contract5, contract6)
-
-  for (contract <- contracts) {
-    // for (dataType <- List("ADJUSTED_LAST", "OPTION_IMPLIED_VOLATILITY")) {
-    for (dataType <- List("TRADES", "OPTION_IMPLIED_VOLATILITY")) {
-      val histReqId = wrapper.reqIdCounter.incrementAndGet()
-
-      val timeframe = "1 week"
-      val duration = "5 Y"
-
-      wrapper.reqIdToContract.put(
-        histReqId,
-        (contract, dataType, timeframe)
-      ) // Store the link between request ID and contract
-
-      wrapper.historicalPromises.put(histReqId, Promise[Unit]())
-
-      // Request historical data
-      wrapper.eClientSocket.reqHistoricalData(
-        histReqId, // tickerId
-        contract, // contract
-        "", // endDateTime
-        duration, // durationString
-        timeframe, // barSizeSetting
-        // "ADJUSTED_LAST", // whatToShow
-        dataType,
-        1, // useRTH, Whether (1) or not (0) to retrieve data generated only within Regular Trading Hours (RTH)
-        1, // formatDate
-        false, // keepUpToDate
-        null
-      )
-
-      results += histReqId
+        // actual network request
+        wrapper.eClientSocket.reqHistoricalData(
+          reqId,
+          contract,
+          "",          // now
+          duration,
+          timeframe,
+          dataType,
+          1,           // RTH only
+          1,           // human-readable dates
+          false,       // do not keep up to date
+          null
+        )
+      }
     }
   }
-
-  results
 }
